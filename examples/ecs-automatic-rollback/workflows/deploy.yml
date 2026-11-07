@@ -1,0 +1,82 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: ecs-rollback-example
+  CLUSTER: ecs-rollback-example
+  SERVICE: ecs-rollback-example
+  CONTAINER: app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Render task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: .aws/task-definition.json
+          container-name: ${{ env.CONTAINER }}
+          image: ${{ steps.image.outputs.image }}
+
+      - name: Deploy to ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.CLUSTER }}
+          service: ${{ env.SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+
+      # The deploy action can report success after the circuit breaker rolled
+      # the service back, so check what the service is actually running.
+      - name: Fail if ECS rolled back
+        if: always() && steps.deploy.outputs.task-definition-arn != ''
+        env:
+          EXPECTED: ${{ steps.deploy.outputs.task-definition-arn }}
+        run: |
+          DEPLOYMENT=$(aws ecs describe-services \
+            --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].deployments[?status==`PRIMARY`] | [0]' \
+            --output json)
+          ACTUAL=$(jq -r '.taskDefinition' <<< "$DEPLOYMENT")
+          STATE=$(jq -r '.rolloutState' <<< "$DEPLOYMENT")
+          REASON=$(jq -r '.rolloutStateReason // ""' <<< "$DEPLOYMENT")
+          echo "Primary deployment: $ACTUAL ($STATE) $REASON"
+          if [ "$ACTUAL" != "$EXPECTED" ] || [ "$STATE" != "COMPLETED" ]; then
+            echo "::error::ECS did not complete the new deployment. It may have rolled back: $REASON"
+            exit 1
+          fi
